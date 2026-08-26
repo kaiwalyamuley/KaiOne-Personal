@@ -1,0 +1,6 @@
+{
+  "name": "KAIONE",
+  "description": "KAIONE Life & Wealth OS — Integrated executive command center for daily finances, health vitals, atomic habits, 360° festival calendar, life planning, and AI Advisor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
