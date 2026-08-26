@@ -7,18 +7,6 @@ import React, { useState, useEffect, useMemo } from 'react';
 import {
   PlusCircle,
   Users,
-  Building2,
-  Download,
-  Wallet,
-  Activity,
-  CheckSquare,
-  Sparkles,
-  TrendingUp,
-  Landmark,
-  Layers,
-  Flame,
-  Target,
-  RefreshCw,
 } from 'lucide-react';
 import {
   Account,
@@ -112,7 +100,6 @@ import {
   processAllDueRecurringRules,
   executeSingleRuleManually,
 } from './utils/recurringEngine';
-import { formatINR } from './utils/formatters';
 import { Navbar, MainPillar, FinanceSubTab } from './components/Navbar';
 import { SummaryCards } from './components/SummaryCards';
 import { TransactionList } from './components/TransactionList';
@@ -136,7 +123,6 @@ import { AddEditVacationModal } from './components/planner/AddEditVacationModal'
 import { LogVitalsModal } from './components/health/LogVitalsModal';
 import { LogWorkoutModal } from './components/health/LogWorkoutModal';
 import { AddEditHabitModal } from './components/habits/AddEditHabitModal';
-import { User } from 'firebase/auth';
 import { CategoryManagementModal } from './components/categories/CategoryManagementModal';
 import { AddEditCategoryModal } from './components/categories/AddEditCategoryModal';
 import { AddEditAccountModal } from './components/financial-engine/AddEditAccountModal';
@@ -147,34 +133,20 @@ import { GmailDailyReminderModal } from './components/sync/GmailDailyReminderMod
 import { MobileBottomNav } from './components/navigation/MobileBottomNav';
 import { MobileQuickActionMenu } from './components/navigation/MobileQuickActionMenu';
 import { motion, AnimatePresence } from 'motion/react';
-import {
-  initAuth,
-  subscribeToSubcollection,
-  subscribeToUserProfile,
-  syncSaveDoc,
-  syncDeleteDoc,
-  syncSaveUserProfile,
-  migrateLocalDataToCloud,
-  getDynamicSyncTokenFromUrl,
-  getEffectiveSyncId,
-  autoSeedCloudIfEmpty,
-  ensureCleanFreshSlate,
-  setCustomSyncCode,
-  wipeAndResetAllData,
-  DEFAULT_SYNC_WORKSPACE_ID,
-} from './utils/firebaseSync';
+import { supabase } from './supabaseClient';
+
+const ACTIVE_USER_ID = 'kai_primary_user';
 
 export default function App() {
-  // Navigation State: Dashboard + 3 Main Pillars + Finance 5 Sub-Modules
+  // Navigation State
   const [activePillar, setActivePillar] = useState<MainPillar>('dashboard');
   const [financeSubTab, setFinanceSubTab] = useState<FinanceSubTab>('daily_log');
   const [activeTypeFilter, setActiveTypeFilter] = useState<TransactionType | 'all'>('all');
   const [isMobileQuickMenuOpen, setIsMobileQuickMenuOpen] = useState<boolean>(false);
 
-  // Firebase Multi-Device Dynamic Sync State (<20ms Latency)
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [authUserId, setAuthUserId] = useState<string>(() => getEffectiveSyncId());
-  const [syncLatencyMs, setSyncLatencyMs] = useState<number>(2);
+  // Sync State
+  const [authUserId, setAuthUserId] = useState<string>(ACTIVE_USER_ID);
+  const [syncLatencyMs, setSyncLatencyMs] = useState<number>(5);
   const [isSyncConnected, setIsSyncConnected] = useState<boolean>(true);
   const [isSyncModalOpen, setIsSyncModalOpen] = useState<boolean>(false);
   const [isGmailReminderModalOpen, setIsGmailReminderModalOpen] = useState<boolean>(false);
@@ -190,23 +162,6 @@ export default function App() {
   const [savingsGoals, setSavingsGoals] = useState<SavingsGoalBucket[]>(() => loadSavingsGoals());
   const [goalBadges, setGoalBadges] = useState<GoalAchievementBadge[]>(() => loadGoalBadges());
   const [wealthParams, setWealthParams] = useState<WealthForecastParams>(() => loadWealthParams());
-
-  // Automatic Due Recurring Rules Processor on App Load
-  useEffect(() => {
-    if (recurringRules.length > 0) {
-      const result = processAllDueRecurringRules(recurringRules);
-      if (result.generatedTransactions.length > 0) {
-        setTransactions((prev) => [...result.generatedTransactions, ...prev]);
-        saveTransactions([...result.generatedTransactions, ...transactions]);
-        setRecurringRules(result.updatedRules);
-        saveRecurringRules(result.updatedRules);
-        if (authUserId) {
-          result.generatedTransactions.forEach((tx) => syncSaveDoc(authUserId, 'transactions', tx));
-          result.updatedRules.forEach((rule) => syncSaveDoc(authUserId, 'recurringRules', rule));
-        }
-      }
-    }
-  }, []);
 
   // Pillar 2: Health State
   const [vitalsLogs, setVitalsLogs] = useState<VitalsLog[]>(() => loadVitalsLogs());
@@ -226,241 +181,216 @@ export default function App() {
   const [vacations, setVacations] = useState<VacationPlan[]>(() => loadVacations());
   const [datesToRemember, setDatesToRemember] = useState<DateToRemember[]>(() => loadDatesToRemember());
 
-  // Initialize Firebase Auth & Real-Time Sync Token
+  // Supabase Table Sync Loader & Realtime Listener
   useEffect(() => {
-    ensureCleanFreshSlate();
-    getDynamicSyncTokenFromUrl();
-    const unsubAuth = initAuth((user) => {
-      setCurrentUser(user);
-      const syncId = getEffectiveSyncId(user);
-      setAuthUserId(syncId);
-      setIsSyncConnected(true);
-    });
-    return () => unsubAuth();
-  }, []);
-
-  // Multi-Device Cloud Real-Time Firestore Sync Listeners & Cloud Auto-Seed
-  useEffect(() => {
-    if (!authUserId) return;
-
-    // Auto-seed cloud if the cloud collection is empty so other devices immediately sync
-    autoSeedCloudIfEmpty(authUserId, {
-      transactions,
-      recurringRules,
-      accounts,
-      categories,
-      creditCards,
-      loans,
-      monthlyBudgets,
-      savingsGoals,
-      goalBadges,
-      wealthParams,
-      habits,
-      habitCompletions,
-      habitBadges,
-      workouts,
-      vitalsLogs,
-      vacations,
-      datesToRemember,
-      userProfile,
-    });
-
-    const unsubs: (() => void)[] = [];
-
-    // Transactions listener (sorted newest first)
-    unsubs.push(
-      subscribeToSubcollection<Transaction>(authUserId, 'transactions', (items) => {
-        const sorted = [...items].sort((a, b) => {
-          const timeA = new Date(a.dateTime || a.createdAt || 0).getTime();
-          const timeB = new Date(b.dateTime || b.createdAt || 0).getTime();
-          return timeB - timeA;
-        });
-        setTransactions(sorted);
-        saveTransactions(sorted);
-      })
-    );
-
-    // Recurring Rules listener
-    unsubs.push(
-      subscribeToSubcollection<RecurringRule>(authUserId, 'recurringRules', (items) => {
-        setRecurringRules(items);
-        saveRecurringRules(items);
-      })
-    );
-
-    // Accounts listener
-    unsubs.push(
-      subscribeToSubcollection<Account>(authUserId, 'accounts', (items) => {
-        if (items.length > 0) {
-          setAccounts(items);
-          saveAccounts(items);
-        } else {
-          setAccounts(DEFAULT_ACCOUNTS);
-          saveAccounts(DEFAULT_ACCOUNTS);
+    async function loadCloudData() {
+      const startTime = performance.now();
+      try {
+        const { data: txData } = await supabase.from('transactions').select('*').eq('user_id', authUserId).order('date_time', { ascending: false });
+        if (txData && txData.length > 0) {
+          const mappedTx: Transaction[] = txData.map((r: any) => ({
+            id: r.id,
+            type: r.type,
+            amount: Number(r.amount),
+            dateTime: r.date_time,
+            category: r.category,
+            subCategory: r.sub_category,
+            accountFromId: r.account_from_id,
+            accountToId: r.account_to_id,
+            personName: r.person_name,
+            personPhone: r.person_phone,
+            dueDate: r.due_date,
+            description: r.description,
+            paymentMode: r.payment_mode,
+            tags: r.tags || [],
+            status: r.status,
+            recurringRuleId: r.recurring_rule_id,
+            createdAt: r.created_at,
+            updatedAt: r.updated_at
+          }));
+          setTransactions(mappedTx);
+          saveTransactions(mappedTx);
         }
-      })
-    );
 
-    // Categories listener
-    unsubs.push(
-      subscribeToSubcollection<Category>(authUserId, 'categories', (items) => {
-        if (items.length > 0) {
-          setCategories(items);
-          saveCategories(items);
-        } else {
-          setCategories(DEFAULT_CATEGORIES);
-          saveCategories(DEFAULT_CATEGORIES);
+        const { data: accData } = await supabase.from('accounts').select('*').eq('user_id', authUserId);
+        if (accData && accData.length > 0) {
+          const mappedAcc: Account[] = accData.map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            type: r.type,
+            initialBalance: Number(r.initial_balance),
+            bankName: r.bank_name,
+            accountNumberLast4: r.account_number_last4,
+            color: r.color,
+            isDefault: r.is_default,
+            interestRate: Number(r.interest_rate),
+            ifscCode: r.ifsc_code,
+            notes: r.notes
+          }));
+          setAccounts(mappedAcc);
+          saveAccounts(mappedAcc);
         }
-      })
-    );
 
-    // Credit Cards listener
-    unsubs.push(
-      subscribeToSubcollection<CreditCard>(authUserId, 'creditCards', (items) => {
-        setCreditCards(items);
-        saveCreditCards(items);
-      })
-    );
-
-    // Loans listener
-    unsubs.push(
-      subscribeToSubcollection<Loan>(authUserId, 'loans', (items) => {
-        setLoans(items);
-        saveLoans(items);
-      })
-    );
-
-    // Monthly Budgets listener
-    unsubs.push(
-      subscribeToSubcollection<MonthlyCategoryBudget>(authUserId, 'monthlyBudgets', (items) => {
-        setMonthlyBudgets(items);
-        saveMonthlyBudgets(items);
-      })
-    );
-
-    // Savings Goals listener
-    unsubs.push(
-      subscribeToSubcollection<SavingsGoalBucket>(authUserId, 'savingsGoals', (items) => {
-        setSavingsGoals(items);
-        saveSavingsGoals(items);
-      })
-    );
-
-    // Goal Badges listener
-    unsubs.push(
-      subscribeToSubcollection<GoalAchievementBadge>(authUserId, 'goalBadges', (items) => {
-        setGoalBadges(items);
-        saveGoalBadges(items);
-      })
-    );
-
-    // Habits listener
-    unsubs.push(
-      subscribeToSubcollection<Habit>(authUserId, 'habits', (items) => {
-        setHabits(items);
-        saveHabits(items);
-      })
-    );
-
-    // Habit Completions listener
-    unsubs.push(
-      subscribeToSubcollection<HabitCompletionRecord>(authUserId, 'habitCompletions', (items) => {
-        setHabitCompletions(items);
-        saveHabitCompletions(items);
-      })
-    );
-
-    // Habit Badges listener
-    unsubs.push(
-      subscribeToSubcollection<HabitBadge>(authUserId, 'habitBadges', (items) => {
-        setHabitBadges(items);
-        saveHabitBadges(items);
-      })
-    );
-
-    // Workouts listener
-    unsubs.push(
-      subscribeToSubcollection<WorkoutSession>(authUserId, 'workouts', (items) => {
-        setWorkouts(items);
-        saveWorkouts(items);
-      })
-    );
-
-    // Vitals listener
-    unsubs.push(
-      subscribeToSubcollection<VitalsLog>(authUserId, 'vitals', (items) => {
-        setVitalsLogs(items);
-        saveVitalsLogs(items);
-      })
-    );
-
-    // Vacations listener
-    unsubs.push(
-      subscribeToSubcollection<VacationPlan>(authUserId, 'vacations', (items) => {
-        setVacations(items);
-        saveVacations(items);
-      })
-    );
-
-    // Dates to remember listener
-    unsubs.push(
-      subscribeToSubcollection<DateToRemember>(authUserId, 'datesToRemember', (items) => {
-        setDatesToRemember(items);
-        saveDatesToRemember(items);
-      })
-    );
-
-    // User Profile listener
-    unsubs.push(
-      subscribeToUserProfile(authUserId, (profile) => {
-        if (profile && profile.name) {
-          setUserProfile(profile);
-          saveUserProfile(profile);
+        const { data: catData } = await supabase.from('categories').select('*').eq('user_id', authUserId);
+        if (catData && catData.length > 0) {
+          const mappedCat: Category[] = catData.map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            type: r.type,
+            icon: r.icon,
+            color: r.color,
+            subcategories: r.subcategories || [],
+            defaultMonthlyBudget: Number(r.default_monthly_budget || 0),
+            isRolloverEnabled: r.is_rollover_enabled,
+            defaultMaxRolloverCap: r.default_max_rollover_cap ? Number(r.default_max_rollover_cap) : undefined
+          }));
+          setCategories(mappedCat);
+          saveCategories(mappedCat);
         }
+
+        const { data: cardData } = await supabase.from('credit_cards').select('*').eq('user_id', authUserId);
+        if (cardData && cardData.length > 0) {
+          const mappedCards: CreditCard[] = cardData.map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            bankName: r.bank_name,
+            cardNumberLast4: r.card_number_last4,
+            cardNetwork: r.card_network,
+            creditLimit: Number(r.credit_limit),
+            currentOutstanding: Number(r.current_outstanding),
+            billingCycleDay: r.billing_cycle_day,
+            paymentDueDay: r.payment_due_day,
+            minAmountDue: Number(r.min_amount_due),
+            rewardPoints: r.reward_points,
+            annualFee: Number(r.annual_fee),
+            annualFeeWaiverSpend: Number(r.annual_fee_waiver_spend),
+            annualSpent: Number(r.annual_spent),
+            cardColor: r.card_color,
+            status: r.status,
+            linkedAccountId: r.linked_account_id,
+            notes: r.notes
+          }));
+          setCreditCards(mappedCards);
+          saveCreditCards(mappedCards);
+        }
+
+        const { data: loanData } = await supabase.from('loans').select('*').eq('user_id', authUserId);
+        if (loanData && loanData.length > 0) {
+          const mappedLoans: Loan[] = loanData.map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            lenderName: r.lender_name,
+            loanType: r.loan_type,
+            principalAmount: Number(r.principal_amount),
+            outstandingPrincipal: Number(r.outstanding_principal),
+            interestRatePercent: Number(r.interest_rate_percent),
+            interestType: r.interest_type,
+            tenureMonths: r.tenure_months,
+            tenureCompletedMonths: r.tenure_completed_months,
+            monthlyEmi: Number(r.monthly_emi),
+            emiDueDay: r.emi_due_day,
+            linkedAccountId: r.linked_account_id,
+            startDate: r.start_date,
+            endDate: r.end_date,
+            prepaymentTotal: Number(r.prepayment_total),
+            accountNumber: r.account_number,
+            status: r.status,
+            notes: r.notes
+          }));
+          setLoans(mappedLoans);
+          saveLoans(mappedLoans);
+        }
+
+        const { data: profData } = await supabase.from('user_profiles').select('*').eq('id', authUserId).single();
+        if (profData) {
+          const mappedProf: UserProfile = {
+            id: profData.id,
+            name: profData.name,
+            email: profData.email,
+            phone: profData.phone,
+            birthdate: profData.birthdate,
+            birthdayFormatted: profData.birthday_formatted,
+            bio: profData.bio,
+            avatar: profData.avatar,
+            city: profData.city,
+            country: profData.country,
+            occupation: profData.occupation,
+            bloodGroup: profData.blood_group,
+            emergencyContactName: profData.emergency_contact_name,
+            emergencyContactPhone: profData.emergency_contact_phone,
+            currencySymbol: profData.currency_symbol,
+            monthlySavingsTarget: Number(profData.monthly_savings_target),
+            emergencyFundTarget: Number(profData.emergency_fund_target),
+            targetWeightKg: Number(profData.target_weight_kg),
+            dailyWaterGoalMl: profData.daily_water_goal_ml,
+            targetDailySleepHours: Number(profData.target_daily_sleep_hours),
+            favoriteFestivals: profData.favorite_festivals || [],
+            themePreference: profData.theme_preference
+          };
+          setUserProfile(mappedProf);
+          saveUserProfile(mappedProf);
+        }
+
+        setIsSyncConnected(true);
+        setSyncLatencyMs(Math.round(performance.now() - startTime));
+      } catch (err) {
+        console.error('Supabase initial load failed:', err);
+      }
+    }
+
+    loadCloudData();
+
+    // Supabase Realtime channel subscription across devices
+    const channel = supabase
+      .channel(`sync_${authUserId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', filter: `user_id=eq.${authUserId}` }, () => {
+        loadCloudData();
       })
-    );
+      .subscribe();
 
     return () => {
-      unsubs.forEach((u) => u());
+      supabase.removeChannel(channel);
     };
   }, [authUserId]);
 
-  const handleMigrateLocalToCloud = async () => {
-    if (!authUserId) return;
-    await migrateLocalDataToCloud(authUserId, {
-      transactions,
-      recurringRules,
-      accounts,
-      categories,
-      creditCards,
-      loans,
-      monthlyBudgets,
-      savingsGoals,
-      goalBadges,
-      wealthParams,
-      habits,
-      habitCompletions,
-      habitBadges,
-      workouts,
-      vitalsLogs,
-      vacations,
-      datesToRemember,
-      userProfile,
-    });
-  };
+  // Automatic Due Recurring Rules Processor
+  useEffect(() => {
+    if (recurringRules.length > 0) {
+      const result = processAllDueRecurringRules(recurringRules);
+      if (result.generatedTransactions.length > 0) {
+        setTransactions((prev) => [...result.generatedTransactions, ...prev]);
+        saveTransactions([...result.generatedTransactions, ...transactions]);
+        setRecurringRules(result.updatedRules);
+        saveRecurringRules(result.updatedRules);
+      }
+    }
+  }, []);
 
-  const handleSwitchSyncWorkspace = (newWorkspaceId: string) => {
-    setAuthUserId(newWorkspaceId);
-  };
+  // Sync to localStorage
+  useEffect(() => { saveTransactions(transactions); }, [transactions]);
+  useEffect(() => { saveAccounts(accounts); }, [accounts]);
+  useEffect(() => { saveCategories(categories); }, [categories]);
+  useEffect(() => { saveCreditCards(creditCards); }, [creditCards]);
+  useEffect(() => { saveLoans(loans); }, [loans]);
+  useEffect(() => { saveMonthlyBudgets(monthlyBudgets); }, [monthlyBudgets]);
+  useEffect(() => { saveSavingsGoals(savingsGoals); }, [savingsGoals]);
+  useEffect(() => { saveGoalBadges(goalBadges); }, [goalBadges]);
+  useEffect(() => { saveWealthParams(wealthParams); }, [wealthParams]);
+  useEffect(() => { saveVitalsLogs(vitalsLogs); }, [vitalsLogs]);
+  useEffect(() => { saveWorkouts(workouts); }, [workouts]);
+  useEffect(() => { saveHabits(habits); }, [habits]);
+  useEffect(() => { saveHabitCompletions(habitCompletions); }, [habitCompletions]);
+  useEffect(() => { saveHabitBadges(habitBadges); }, [habitBadges]);
+  useEffect(() => { saveUserProfile(userProfile); }, [userProfile]);
+  useEffect(() => { saveVacations(vacations); }, [vacations]);
+  useEffect(() => { saveDatesToRemember(datesToRemember); }, [datesToRemember]);
 
-  // Profile & Planner Modals state
+  // Modal States
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
   const [isAddDateModalOpen, setIsAddDateModalOpen] = useState(false);
   const [editingDate, setEditingDate] = useState<DateToRemember | null>(null);
   const [isAddVacationModalOpen, setIsAddVacationModalOpen] = useState(false);
   const [editingVacation, setEditingVacation] = useState<VacationPlan | null>(null);
-
-  // Transaction Form & Navigation Modals state
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [editTx, setEditTx] = useState<Transaction | null>(null);
   const [formDefaultType, setFormDefaultType] = useState<TransactionType>('expense');
@@ -470,118 +400,28 @@ export default function App() {
   const [formDefaultCategory, setFormDefaultCategory] = useState<string>('');
   const [formDefaultAmount, setFormDefaultAmount] = useState<number | undefined>(undefined);
   const [formDefaultDescription, setFormDefaultDescription] = useState<string>('');
-
   const [isLedgerModalOpen, setIsLedgerModalOpen] = useState(false);
   const [isAccountsModalOpen, setIsAccountsModalOpen] = useState(false);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
-
-  // AI Advisor State (Simple Words & 100% Satisfaction)
   const [isAIAdvisorOpen, setIsAIAdvisorOpen] = useState(false);
   const [aiAdvisorInitialPrompt, setAiAdvisorInitialPrompt] = useState<string | undefined>(undefined);
-
-  const handleOpenAIAdvisor = (prompt?: string) => {
-    setAiAdvisorInitialPrompt(prompt);
-    setIsAIAdvisorOpen(true);
-  };
-
-  // Category & Quick Bank Account Modal States
   const [isCategoryManagerOpen, setIsCategoryManagerOpen] = useState(false);
   const [isAddCategoryOpen, setIsAddCategoryOpen] = useState(false);
   const [editingCategory, setEditingCategory] = useState<Category | null>(null);
   const [isQuickAddAccountOpen, setIsQuickAddAccountOpen] = useState(false);
   const [editingQuickAccount, setEditingQuickAccount] = useState<Account | null>(null);
 
-  // Sync to localStorage
-  useEffect(() => {
-    saveTransactions(transactions);
-  }, [transactions]);
-
-  useEffect(() => {
-    saveAccounts(accounts);
-  }, [accounts]);
-
-  useEffect(() => {
-    saveCategories(categories);
-  }, [categories]);
-
-  useEffect(() => {
-    saveCreditCards(creditCards);
-  }, [creditCards]);
-
-  useEffect(() => {
-    saveLoans(loans);
-  }, [loans]);
-
-  useEffect(() => {
-    saveMonthlyBudgets(monthlyBudgets);
-  }, [monthlyBudgets]);
-
-  useEffect(() => {
-    saveSavingsGoals(savingsGoals);
-  }, [savingsGoals]);
-
-  useEffect(() => {
-    saveGoalBadges(goalBadges);
-  }, [goalBadges]);
-
-  useEffect(() => {
-    saveWealthParams(wealthParams);
-  }, [wealthParams]);
-
-  useEffect(() => {
-    saveVitalsLogs(vitalsLogs);
-  }, [vitalsLogs]);
-
-  useEffect(() => {
-    saveWorkouts(workouts);
-  }, [workouts]);
-
-  useEffect(() => {
-    saveHabits(habits);
-  }, [habits]);
-
-  useEffect(() => {
-    saveHabitCompletions(habitCompletions);
-  }, [habitCompletions]);
-
-  useEffect(() => {
-    saveHabitBadges(habitBadges);
-  }, [habitBadges]);
-
-  useEffect(() => {
-    saveUserProfile(userProfile);
-  }, [userProfile]);
-
-  useEffect(() => {
-    saveVacations(vacations);
-  }, [vacations]);
-
-  useEffect(() => {
-    saveDatesToRemember(datesToRemember);
-  }, [datesToRemember]);
-
   // Derived Calculations
-  const accountBalances = useMemo(() => {
-    return calculateAccountBalances(accounts, transactions);
-  }, [accounts, transactions]);
+  const accountBalances = useMemo(() => calculateAccountBalances(accounts, transactions), [accounts, transactions]);
+  const financialSummary: FinancialSummary = useMemo(() => calculateFinancialSummary(accounts, transactions, creditCards, loans), [accounts, transactions, creditCards, loans]);
+  const personLedgers: PersonLedger[] = useMemo(() => calculatePersonLedgers(transactions), [transactions]);
+  const formattedToday = useMemo(() => new Intl.DateTimeFormat('en-IN', { month: 'long', day: 'numeric', year: 'numeric' }).format(new Date()), []);
 
-  const financialSummary: FinancialSummary = useMemo(() => {
-    return calculateFinancialSummary(accounts, transactions, creditCards, loans);
-  }, [accounts, transactions, creditCards, loans]);
+  const handleOpenAIAdvisor = (prompt?: string) => {
+    setAiAdvisorInitialPrompt(prompt);
+    setIsAIAdvisorOpen(true);
+  };
 
-  const personLedgers: PersonLedger[] = useMemo(() => {
-    return calculatePersonLedgers(transactions);
-  }, [transactions]);
-
-  const formattedToday = useMemo(() => {
-    return new Intl.DateTimeFormat('en-IN', {
-      month: 'long',
-      day: 'numeric',
-      year: 'numeric',
-    }).format(new Date());
-  }, []);
-
-  // Handlers for Transactions
   const handleOpenNewTransaction = (
     type: TransactionType = 'expense',
     person?: string,
@@ -602,181 +442,384 @@ export default function App() {
     setIsFormOpen(true);
   };
 
-  const handleSaveTransaction = (
+  const handleSaveTransaction = async (
     txData: Omit<Transaction, 'id' | 'createdAt' | 'updatedAt'>,
     editId?: string
   ) => {
     const nowIso = new Date().toISOString();
+    const txId = editId || `tx_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const newTx: Transaction = {
+      ...txData,
+      id: txId,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
 
     if (editId) {
-      const updatedTx: Transaction = {
-        ...txData,
-        id: editId,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
-      setTransactions((prev) =>
-        prev.map((t) => (t.id === editId ? updatedTx : t))
-      );
-      if (authUserId) {
-        syncSaveDoc(authUserId, 'transactions', updatedTx).then((lat) => setSyncLatencyMs(lat));
-      }
+      setTransactions((prev) => prev.map((t) => (t.id === editId ? newTx : t)));
     } else {
-      const newTx: Transaction = {
-        ...txData,
-        id: `tx_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
       setTransactions((prev) => [newTx, ...prev]);
-      if (authUserId) {
-        syncSaveDoc(authUserId, 'transactions', newTx).then((lat) => setSyncLatencyMs(lat));
-      }
-
-      if (txData.type === 'transfer' && txData.accountToId) {
-        const matchedCard = creditCards.find((c) => c.id === txData.accountToId);
-        if (matchedCard) {
-          const updatedCard = {
-            ...matchedCard,
-            currentOutstanding: Math.max(0, matchedCard.currentOutstanding - txData.amount),
-          };
-          setCreditCards((prev) =>
-            prev.map((c) => (c.id === matchedCard.id ? updatedCard : c))
-          );
-          if (authUserId) {
-            syncSaveDoc(authUserId, 'creditCards', updatedCard);
-          }
-        }
-      }
     }
+
+    await supabase.from('transactions').upsert({
+      id: txId,
+      user_id: authUserId,
+      type: newTx.type,
+      amount: newTx.amount,
+      date_time: newTx.dateTime,
+      category: newTx.category,
+      sub_category: newTx.subCategory || null,
+      account_from_id: newTx.accountFromId || null,
+      account_to_id: newTx.accountToId || null,
+      person_name: newTx.personName || null,
+      person_phone: newTx.personPhone || null,
+      due_date: newTx.dueDate || null,
+      description: newTx.description || null,
+      payment_mode: newTx.paymentMode || 'UPI',
+      tags: newTx.tags || [],
+      status: newTx.status || 'completed',
+      recurring_rule_id: newTx.recurringRuleId || null,
+    });
   };
 
-  const handleDeleteTransaction = (id: string) => {
+  const handleDeleteTransaction = async (id: string) => {
     setTransactions((prev) => prev.filter((t) => t.id !== id));
-    if (authUserId) {
-      syncDeleteDoc(authUserId, 'transactions', id).then((lat) => setSyncLatencyMs(lat));
+    await supabase.from('transactions').delete().eq('id', id);
+  };
+
+  const handleSaveAccount = async (newAcc: Account) => {
+    setAccounts((prev) => {
+      const exists = prev.some((a) => a.id === newAcc.id);
+      return exists ? prev.map((a) => (a.id === newAcc.id ? newAcc : a)) : [...prev, newAcc];
+    });
+
+    await supabase.from('accounts').upsert({
+      id: newAcc.id,
+      user_id: authUserId,
+      name: newAcc.name,
+      type: newAcc.type,
+      initial_balance: newAcc.initialBalance,
+      bank_name: newAcc.bankName || null,
+      account_number_last4: newAcc.accountNumberLast4 || null,
+      color: newAcc.color || null,
+      is_default: newAcc.isDefault || false,
+      interest_rate: newAcc.interestRate || 0,
+      ifsc_code: newAcc.ifscCode || null,
+      notes: newAcc.notes || null,
+    });
+  };
+
+  const handleDeleteAccount = async (accId: string) => {
+    if (accounts.length <= 1) {
+      alert('You must keep at least one account.');
+      return;
+    }
+    if (window.confirm('Delete this account? Existing transaction records will be preserved.')) {
+      setAccounts((prev) => prev.filter((a) => a.id !== accId));
+      await supabase.from('accounts').delete().eq('id', accId);
     }
   };
 
-  // Handlers for Recurring Rules
-  const handleSaveRecurringRule = (
+  const handleSaveCategory = async (cat: Category) => {
+    setCategories((prev) => {
+      const exists = prev.some((c) => c.id === cat.id);
+      return exists ? prev.map((c) => (c.id === cat.id ? cat : c)) : [...prev, cat];
+    });
+
+    await supabase.from('categories').upsert({
+      id: cat.id,
+      user_id: authUserId,
+      name: cat.name,
+      type: cat.type,
+      icon: cat.icon,
+      color: cat.color || null,
+      subcategories: cat.subcategories || [],
+      default_monthly_budget: cat.defaultMonthlyBudget || 0,
+      is_rollover_enabled: cat.isRolloverEnabled ?? true,
+      default_max_rollover_cap: cat.defaultMaxRolloverCap || null,
+    });
+  };
+
+  const handleDeleteCategory = async (catId: string) => {
+    if (categories.length <= 1) {
+      alert('You must keep at least one category.');
+      return;
+    }
+    if (window.confirm('Delete this category? Existing transactions will retain their category name.')) {
+      setCategories((prev) => prev.filter((c) => c.id !== catId));
+      await supabase.from('categories').delete().eq('id', catId);
+    }
+  };
+
+  const handleSaveCreditCard = async (card: CreditCard) => {
+    setCreditCards((prev) => {
+      const exists = prev.some((c) => c.id === card.id);
+      return exists ? prev.map((c) => (c.id === card.id ? card : c)) : [...prev, card];
+    });
+
+    await supabase.from('credit_cards').upsert({
+      id: card.id,
+      user_id: authUserId,
+      name: card.name,
+      bank_name: card.bankName,
+      card_number_last4: card.cardNumberLast4,
+      card_network: card.cardNetwork,
+      credit_limit: card.creditLimit,
+      current_outstanding: card.currentOutstanding,
+      billing_cycle_day: card.billingCycleDay,
+      payment_due_day: card.paymentDueDay,
+      min_amount_due: card.minAmountDue || 0,
+      reward_points: card.rewardPoints || 0,
+      annual_fee: card.annualFee || 0,
+      annual_fee_waiver_spend: card.annualFeeWaiverSpend || 0,
+      annual_spent: card.annualSpent || 0,
+      card_color: card.cardColor || null,
+      status: card.status,
+      linked_account_id: card.linkedAccountId || null,
+      notes: card.notes || null,
+    });
+  };
+
+  const handleDeleteCreditCard = async (cardId: string) => {
+    if (window.confirm('Are you sure you want to remove this credit card?')) {
+      setCreditCards((prev) => prev.filter((c) => c.id !== cardId));
+      await supabase.from('credit_cards').delete().eq('id', cardId);
+    }
+  };
+
+  const handleSaveLoan = async (loan: Loan) => {
+    setLoans((prev) => {
+      const exists = prev.some((l) => l.id === loan.id);
+      return exists ? prev.map((l) => (l.id === loan.id ? loan : l)) : [...prev, loan];
+    });
+
+    await supabase.from('loans').upsert({
+      id: loan.id,
+      user_id: authUserId,
+      name: loan.name,
+      lender_name: loan.lenderName,
+      loan_type: loan.loanType,
+      principal_amount: loan.principalAmount,
+      outstanding_principal: loan.outstandingPrincipal,
+      interest_rate_percent: loan.interestRatePercent,
+      interest_type: loan.interestType,
+      tenure_months: loan.tenureMonths,
+      tenure_completed_months: loan.tenureCompletedMonths,
+      monthly_emi: loan.monthlyEmi,
+      emi_due_day: loan.emiDueDay,
+      linked_account_id: loan.linkedAccountId || null,
+      start_date: loan.startDate,
+      end_date: loan.endDate || null,
+      prepayment_total: loan.prepaymentTotal || 0,
+      account_number: loan.accountNumber || null,
+      status: loan.status,
+      notes: loan.notes || null,
+    });
+  };
+
+  const handleDeleteLoan = async (loanId: string) => {
+    if (window.confirm('Are you sure you want to remove this loan record?')) {
+      setLoans((prev) => prev.filter((l) => l.id !== loanId));
+      await supabase.from('loans').delete().eq('id', loanId);
+    }
+  };
+
+  const handleSaveMonthlyBudget = async (budget: MonthlyCategoryBudget) => {
+    setMonthlyBudgets((prev) => {
+      const idx = prev.findIndex((b) => b.month === budget.month && b.categoryId === budget.categoryId);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = budget;
+        return next;
+      }
+      return [...prev, budget];
+    });
+
+    await supabase.from('monthly_category_budgets').upsert({
+      id: `${authUserId}_${budget.month}_${budget.categoryId}`,
+      user_id: authUserId,
+      month: budget.month,
+      category_id: budget.categoryId,
+      base_budget: budget.baseBudget,
+      rollover_enabled: budget.rolloverEnabled,
+      max_rollover_cap: budget.maxRolloverCap || null,
+      manual_rollover_override: budget.manualRolloverOverride || null,
+      manual_rollover_notes: budget.manualRolloverNotes || null,
+      notes: budget.notes || null,
+    });
+  };
+
+  const handleSaveBatchMonthlyBudgets = async (budgets: MonthlyCategoryBudget[]) => {
+    setMonthlyBudgets((prev) => {
+      const updatedMap = new Map<string, MonthlyCategoryBudget>();
+      prev.forEach((b) => updatedMap.set(`${b.month}_${b.categoryId}`, b));
+      budgets.forEach((b) => updatedMap.set(`${b.month}_${b.categoryId}`, b));
+      return Array.from(updatedMap.values());
+    });
+
+    for (const b of budgets) {
+      await handleSaveMonthlyBudget(b);
+    }
+  };
+
+  const handleSaveGoal = async (goal: SavingsGoalBucket) => {
+    setSavingsGoals((prev) => {
+      const exists = prev.some((g) => g.id === goal.id);
+      return exists ? prev.map((g) => (g.id === goal.id ? goal : g)) : [...prev, goal];
+    });
+
+    await supabase.from('savings_goals').upsert({
+      id: goal.id,
+      user_id: authUserId,
+      title: goal.title,
+      category: goal.category,
+      target_amount: goal.targetAmount,
+      current_saved: goal.currentSaved,
+      target_date: goal.targetDate,
+      start_date: goal.startDate,
+      monthly_target: goal.monthlyTarget || 0,
+      priority: goal.priority || 'medium',
+      color: goal.color || null,
+      icon: goal.icon || null,
+      linked_account_id: goal.linkedAccountId || null,
+      monthly_streak: goal.monthlyStreak || 0,
+      last_contribution_month: goal.lastContributionMonth || null,
+      status: goal.status || 'in_progress',
+      notes: goal.notes || null,
+    });
+  };
+
+  const handleDeleteGoal = async (goalId: string) => {
+    setSavingsGoals((prev) => prev.filter((g) => g.id !== goalId));
+    await supabase.from('savings_goals').delete().eq('id', goalId);
+  };
+
+  const handleRecordGoalDeposit = async (
+    goalId: string,
+    contribution: GoalContribution,
+    newTotalSaved: number,
+    isStreakIncrement: boolean
+  ) => {
+    let updatedGoal: SavingsGoalBucket | null = null;
+    setSavingsGoals((prev) =>
+      prev.map((g) => {
+        if (g.id === goalId) {
+          const newStreak = isStreakIncrement ? g.monthlyStreak + 1 : g.monthlyStreak;
+          const status = newTotalSaved >= g.targetAmount ? 'completed' : 'in_progress';
+          updatedGoal = {
+            ...g,
+            currentSaved: newTotalSaved,
+            monthlyStreak: newStreak,
+            lastContributionMonth: contribution.month,
+            status,
+            contributions: [contribution, ...(g.contributions || [])],
+          };
+          return updatedGoal;
+        }
+        return g;
+      })
+    );
+
+    if (updatedGoal) {
+      await handleSaveGoal(updatedGoal);
+      await supabase.from('goal_contributions').insert({
+        id: contribution.id || `gc_${Date.now()}`,
+        goal_id: goalId,
+        amount: contribution.amount,
+        date: contribution.date,
+        month: contribution.month,
+        note: contribution.note || null,
+        from_account_id: contribution.fromAccountId || null,
+      });
+    }
+  };
+
+  const handleSaveRecurringRule = async (
     ruleData: Omit<RecurringRule, 'id' | 'createdAt' | 'updatedAt'>,
     editId?: string
   ) => {
     const nowIso = new Date().toISOString();
+    const ruleId = editId || `rec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const updatedRule: RecurringRule = {
+      ...ruleData,
+      id: ruleId,
+      totalTimesGenerated: 0,
+      totalAmountGenerated: 0,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+
     if (editId) {
-      const existing = recurringRules.find((r) => r.id === editId);
-      const updatedRule: RecurringRule = {
-        ...ruleData,
-        id: editId,
-        totalTimesGenerated: existing ? existing.totalTimesGenerated : 0,
-        totalAmountGenerated: existing ? existing.totalAmountGenerated : 0,
-        lastGeneratedDate: existing ? existing.lastGeneratedDate : undefined,
-        createdAt: existing ? existing.createdAt : nowIso,
-        updatedAt: nowIso,
-      };
-      setRecurringRules((prev) =>
-        prev.map((r) => (r.id === editId ? updatedRule : r))
-      );
-      saveRecurringRules(
-        recurringRules.map((r) => (r.id === editId ? updatedRule : r))
-      );
-      if (authUserId) {
-        syncSaveDoc(authUserId, 'recurringRules', updatedRule).then((lat) => setSyncLatencyMs(lat));
-      }
+      setRecurringRules((prev) => prev.map((r) => (r.id === editId ? updatedRule : r)));
     } else {
-      const newRule: RecurringRule = {
-        ...ruleData,
-        id: `rec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        totalTimesGenerated: 0,
-        totalAmountGenerated: 0,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
-      const updatedRules = [newRule, ...recurringRules];
-      setRecurringRules(updatedRules);
-      saveRecurringRules(updatedRules);
-      if (authUserId) {
-        syncSaveDoc(authUserId, 'recurringRules', newRule).then((lat) => setSyncLatencyMs(lat));
-      }
+      setRecurringRules((prev) => [updatedRule, ...prev]);
     }
+
+    await supabase.from('recurring_rules').upsert({
+      id: ruleId,
+      user_id: authUserId,
+      title: updatedRule.title,
+      type: updatedRule.type,
+      amount: updatedRule.amount,
+      category: updatedRule.category,
+      sub_category: updatedRule.subCategory || null,
+      account_from_id: updatedRule.accountFromId || null,
+      account_to_id: updatedRule.accountToId || null,
+      payment_mode: updatedRule.paymentMode || 'Auto Debit',
+      location: updatedRule.location || null,
+      description: updatedRule.description || null,
+      interval: updatedRule.interval,
+      interval_count: updatedRule.intervalCount || 1,
+      day_of_month: updatedRule.dayOfMonth || null,
+      day_of_week: updatedRule.dayOfWeek ?? null,
+      start_date: updatedRule.startDate,
+      end_date: updatedRule.endDate || null,
+      next_execution_date: updatedRule.nextExecutionDate,
+      last_generated_date: updatedRule.lastGeneratedDate || null,
+      total_times_generated: updatedRule.totalTimesGenerated || 0,
+      total_amount_generated: updatedRule.totalAmountGenerated || 0,
+      status: updatedRule.status,
+      auto_generate: updatedRule.autoGenerate ?? true,
+      tags: updatedRule.tags || [],
+    });
   };
 
-  const handleDeleteRecurringRule = (id: string) => {
-    const updated = recurringRules.filter((r) => r.id !== id);
-    setRecurringRules(updated);
-    saveRecurringRules(updated);
-    if (authUserId) {
-      syncDeleteDoc(authUserId, 'recurringRules', id).then((lat) => setSyncLatencyMs(lat));
-    }
+  const handleDeleteRecurringRule = async (id: string) => {
+    setRecurringRules((prev) => prev.filter((r) => r.id !== id));
+    await supabase.from('recurring_rules').delete().eq('id', id);
   };
 
   const handleToggleRecurringRuleStatus = (id: string, newStatus: 'active' | 'paused' | 'stopped') => {
-    let updatedRule: RecurringRule | null = null;
-    const updated = recurringRules.map((r) => {
-      if (r.id === id) {
-        updatedRule = {
-          ...r,
-          status: newStatus,
-          updatedAt: new Date().toISOString(),
-        };
-        return updatedRule;
-      }
-      return r;
-    });
-    setRecurringRules(updated);
-    saveRecurringRules(updated);
-    if (updatedRule && authUserId) {
-      syncSaveDoc(authUserId, 'recurringRules', updatedRule).then((lat) => setSyncLatencyMs(lat));
-    }
+    setRecurringRules((prev) =>
+      prev.map((r) => {
+        if (r.id === id) {
+          const u = { ...r, status: newStatus, updatedAt: new Date().toISOString() };
+          handleSaveRecurringRule(u, id);
+          return u;
+        }
+        return r;
+      })
+    );
   };
 
   const handleExecuteRecurringRuleNow = (rule: RecurringRule) => {
     const { generatedTransaction, updatedRule } = executeSingleRuleManually(rule);
-    const updatedTxs = [generatedTransaction, ...transactions];
-    setTransactions(updatedTxs);
-    saveTransactions(updatedTxs);
-
-    const updatedRules = recurringRules.map((r) => (r.id === rule.id ? updatedRule : r));
-    setRecurringRules(updatedRules);
-    saveRecurringRules(updatedRules);
-
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'transactions', generatedTransaction).then((lat) => setSyncLatencyMs(lat));
-      syncSaveDoc(authUserId, 'recurringRules', updatedRule).then((lat) => setSyncLatencyMs(lat));
-    }
+    handleSaveTransaction(generatedTransaction);
+    handleSaveRecurringRule(updatedRule, updatedRule.id);
   };
 
   const handleProcessAllDueRecurringRules = () => {
     const result = processAllDueRecurringRules(recurringRules);
-    if (result.generatedTransactions.length > 0) {
-      const updatedTxs = [...result.generatedTransactions, ...transactions];
-      setTransactions(updatedTxs);
-      saveTransactions(updatedTxs);
-
-      setRecurringRules(result.updatedRules);
-      saveRecurringRules(result.updatedRules);
-
-      if (authUserId) {
-        result.generatedTransactions.forEach((tx) => syncSaveDoc(authUserId, 'transactions', tx));
-        result.updatedRules.forEach((rule) => syncSaveDoc(authUserId, 'recurringRules', rule));
-      }
-    }
+    result.generatedTransactions.forEach((tx) => handleSaveTransaction(tx));
+    result.updatedRules.forEach((rule) => handleSaveRecurringRule(rule, rule.id));
   };
 
   const handleDuplicateTransaction = (tx: Transaction) => {
-    const duplicated: Transaction = {
+    handleSaveTransaction({
       ...tx,
-      id: `tx_${Date.now()}_dup`,
       dateTime: new Date().toISOString(),
       description: tx.description ? `${tx.description} (Copy)` : 'Copy',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    setTransactions((prev) => [duplicated, ...prev]);
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'transactions', duplicated).then((lat) => setSyncLatencyMs(lat));
-    }
+    });
   };
 
   const handleEditTransaction = (tx: Transaction) => {
@@ -807,268 +850,89 @@ export default function App() {
     );
   };
 
-  const handleUpdatePersonPhoneAndDueDate = (
-    personName: string,
-    phone: string,
-    dueDate: string
-  ) => {
+  const handleUpdatePersonPhoneAndDueDate = (personName: string, phone: string, dueDate: string) => {
     setTransactions((prev) =>
       prev.map((t) => {
         if (t.personName && t.personName.toLowerCase() === personName.toLowerCase()) {
-          return {
-            ...t,
-            personPhone: phone || t.personPhone,
-            dueDate: dueDate || t.dueDate,
-            updatedAt: new Date().toISOString(),
-          };
+          const updated = { ...t, personPhone: phone || t.personPhone, dueDate: dueDate || t.dueDate };
+          handleSaveTransaction(updated, updated.id);
+          return updated;
         }
         return t;
       })
     );
   };
 
-  // Account Handlers
-  const handleSaveAccount = (newAcc: Account) => {
-    setAccounts((prev) => {
-      const exists = prev.some((a) => a.id === newAcc.id);
-      if (exists) {
-        return prev.map((a) => (a.id === newAcc.id ? newAcc : a));
-      }
-      return [...prev, newAcc];
-    });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'accounts', newAcc).then((lat) => setSyncLatencyMs(lat));
-    }
-  };
-
-  const handleDeleteAccount = (accId: string) => {
-    if (accounts.length <= 1) {
-      alert('You must keep at least one account.');
-      return;
-    }
-    if (window.confirm('Delete this account? Existing transaction records will be preserved.')) {
-      setAccounts((prev) => prev.filter((a) => a.id !== accId));
-      if (authUserId) {
-        syncDeleteDoc(authUserId, 'accounts', accId).then((lat) => setSyncLatencyMs(lat));
-      }
-    }
-  };
-
-  // Credit Card Handlers
-  const handleSaveCreditCard = (card: CreditCard) => {
-    setCreditCards((prev) => {
-      const exists = prev.some((c) => c.id === card.id);
-      if (exists) {
-        return prev.map((c) => (c.id === card.id ? card : c));
-      }
-      return [...prev, card];
-    });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'creditCards', card).then((lat) => setSyncLatencyMs(lat));
-    }
-  };
-
-  const handleDeleteCreditCard = (cardId: string) => {
-    if (window.confirm('Are you sure you want to remove this credit card?')) {
-      setCreditCards((prev) => prev.filter((c) => c.id !== cardId));
-      if (authUserId) {
-        syncDeleteDoc(authUserId, 'creditCards', cardId).then((lat) => setSyncLatencyMs(lat));
-      }
-    }
-  };
-
-  // Loan Handlers
-  const handleSaveLoan = (loan: Loan) => {
-    setLoans((prev) => {
-      const exists = prev.some((l) => l.id === loan.id);
-      if (exists) {
-        return prev.map((l) => (l.id === loan.id ? loan : l));
-      }
-      return [...prev, loan];
-    });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'loans', loan).then((lat) => setSyncLatencyMs(lat));
-    }
-  };
-
-  const handleDeleteLoan = (loanId: string) => {
-    if (window.confirm('Are you sure you want to remove this loan record?')) {
-      setLoans((prev) => prev.filter((l) => l.id !== loanId));
-      if (authUserId) {
-        syncDeleteDoc(authUserId, 'loans', loanId).then((lat) => setSyncLatencyMs(lat));
-      }
-    }
-  };
-
-  // Budget Rollover & Annual Matrix Handlers
-  const handleSaveMonthlyBudget = (budget: MonthlyCategoryBudget) => {
-    setMonthlyBudgets((prev) => {
-      const idx = prev.findIndex(
-        (b) => b.month === budget.month && b.categoryId === budget.categoryId
-      );
-      if (idx >= 0) {
-        const next = [...prev];
-        next[idx] = budget;
-        return next;
-      }
-      return [...prev, budget];
-    });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'monthlyBudgets', budget, `${budget.month}_${budget.categoryId}`).then((lat) =>
-        setSyncLatencyMs(lat)
-      );
-    }
-  };
-
-  const handleSaveBatchMonthlyBudgets = (budgets: MonthlyCategoryBudget[]) => {
-    setMonthlyBudgets((prev) => {
-      const updatedMap = new Map<string, MonthlyCategoryBudget>();
-      prev.forEach((b) => updatedMap.set(`${b.month}_${b.categoryId}`, b));
-      budgets.forEach((b) => updatedMap.set(`${b.month}_${b.categoryId}`, b));
-      return Array.from(updatedMap.values());
-    });
-    if (authUserId) {
-      budgets.forEach((b) => {
-        syncSaveDoc(authUserId, 'monthlyBudgets', b, `${b.month}_${b.categoryId}`);
-      });
-    }
-  };
-
-  // Category Management Handlers
-  const handleSaveCategory = (cat: Category) => {
-    setCategories((prev) => {
-      const exists = prev.some((c) => c.id === cat.id);
-      if (exists) {
-        return prev.map((c) => (c.id === cat.id ? cat : c));
-      }
-      return [...prev, cat];
-    });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'categories', cat).then((lat) => setSyncLatencyMs(lat));
-    }
-  };
-
-  const handleDeleteCategory = (catId: string) => {
-    if (categories.length <= 1) {
-      alert('You must keep at least one category.');
-      return;
-    }
-    if (window.confirm('Delete this category? Existing transactions will retain their category name.')) {
-      setCategories((prev) => prev.filter((c) => c.id !== catId));
-      if (authUserId) {
-        syncDeleteDoc(authUserId, 'categories', catId).then((lat) => setSyncLatencyMs(lat));
-      }
-    }
-  };
-
-  // Savings Goal Handlers
-  const handleSaveGoal = (goal: SavingsGoalBucket) => {
-    setSavingsGoals((prev) => {
-      const exists = prev.some((g) => g.id === goal.id);
-      if (exists) {
-        return prev.map((g) => (g.id === goal.id ? goal : g));
-      }
-      return [...prev, goal];
-    });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'savingsGoals', goal).then((lat) => setSyncLatencyMs(lat));
-    }
-  };
-
-  const handleDeleteGoal = (goalId: string) => {
-    setSavingsGoals((prev) => prev.filter((g) => g.id !== goalId));
-    if (authUserId) {
-      syncDeleteDoc(authUserId, 'savingsGoals', goalId).then((lat) => setSyncLatencyMs(lat));
-    }
-  };
-
-  const handleRecordGoalDeposit = (
-    goalId: string,
-    contribution: GoalContribution,
-    newTotalSaved: number,
-    isStreakIncrement: boolean
-  ) => {
-    let updatedGoal: SavingsGoalBucket | null = null;
-    setSavingsGoals((prev) =>
-      prev.map((g) => {
-        if (g.id === goalId) {
-          const newStreak = isStreakIncrement ? g.monthlyStreak + 1 : g.monthlyStreak;
-          const status = newTotalSaved >= g.targetAmount ? 'completed' : 'in_progress';
-          updatedGoal = {
-            ...g,
-            currentSaved: newTotalSaved,
-            monthlyStreak: newStreak,
-            lastContributionMonth: contribution.month,
-            status,
-            contributions: [contribution, ...(g.contributions || [])],
-          };
-          return updatedGoal;
-        }
-        return g;
-      })
-    );
-
-    if (updatedGoal && authUserId) {
-      syncSaveDoc(authUserId, 'savingsGoals', updatedGoal).then((lat) => setSyncLatencyMs(lat));
-    }
-
-    // Also auto-evaluate badges
-    setGoalBadges((prev) =>
-      prev.map((b) => {
-        if (b.id === 'badge_first_deposit' && !b.isUnlocked) {
-          return {
-            ...b,
-            isUnlocked: true,
-            progressPercent: 100,
-            unlockedAt: new Date().toISOString().split('T')[0],
-          };
-        }
-        return b;
-      })
-    );
-  };
-
-  // Health Handlers
-  const handleSaveVitals = (log: VitalsLog) => {
+  const handleSaveVitals = async (log: VitalsLog) => {
     setVitalsLogs((prev) => [log, ...prev.filter((l) => l.date !== log.date)]);
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'vitals', log).then((lat) => setSyncLatencyMs(lat));
-    }
+    await supabase.from('vitals_logs').upsert({
+      id: `${authUserId}_${log.date}`,
+      user_id: authUserId,
+      date: log.date,
+      weight_kg: log.weightKg || null,
+      systolic_bp: log.systolicBp || null,
+      diastolic_bp: log.diastolicBp || null,
+      resting_heart_rate: log.restingHeartRate || null,
+      blood_sugar_mg_dl: log.bloodSugarMgDl || null,
+      sleep_hours: log.sleepHours || null,
+      sleep_quality: log.sleepQuality || null,
+      water_ml: log.waterMl || null,
+      energy_level: log.energyLevel || null,
+      notes: log.notes || null,
+    });
   };
 
-  const handleSaveWorkout = (workout: WorkoutSession) => {
-    setWorkouts((prev) => [workout, ...prev]);
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'workouts', workout).then((lat) => setSyncLatencyMs(lat));
-    }
+  const handleSaveWorkout = async (workout: WorkoutSession) => {
+    const wId = workout.id || `wo_${Date.now()}`;
+    const newWo = { ...workout, id: wId };
+    setWorkouts((prev) => [newWo, ...prev]);
+
+    await supabase.from('workout_sessions').upsert({
+      id: wId,
+      user_id: authUserId,
+      date: newWo.date,
+      type: newWo.type,
+      duration_minutes: newWo.durationMinutes,
+      calories_burned: newWo.caloriesBurned || null,
+      distance_km: newWo.distanceKm || null,
+      intensity: newWo.intensity,
+      notes: newWo.notes || null,
+    });
   };
 
-  // Habits Handlers
-  const handleSaveHabit = (habit: Habit) => {
+  const handleSaveHabit = async (habit: Habit) => {
     setHabits((prev) => {
       const exists = prev.some((h) => h.id === habit.id);
-      if (exists) {
-        return prev.map((h) => (h.id === habit.id ? habit : h));
-      }
-      return [...prev, habit];
+      return exists ? prev.map((h) => (h.id === habit.id ? habit : h)) : [...prev, habit];
     });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'habits', habit).then((lat) => setSyncLatencyMs(lat));
-    }
+
+    await supabase.from('habits').upsert({
+      id: habit.id,
+      user_id: authUserId,
+      title: habit.title,
+      category: habit.category,
+      cue: habit.cue || null,
+      routine: habit.routine,
+      reward: habit.reward || null,
+      frequency: habit.frequency,
+      time_of_day: habit.timeOfDay,
+      target_days_per_month: habit.targetDaysPerMonth || 30,
+      color: habit.color || null,
+      icon: habit.icon || null,
+      current_streak: habit.currentStreak || 0,
+      best_streak: habit.bestStreak || 0,
+      total_completions: habit.totalCompletions || 0,
+      active: habit.active ?? true,
+    });
   };
 
-  const handleDeleteHabit = (habitId: string) => {
+  const handleDeleteHabit = async (habitId: string) => {
     setHabits((prev) => prev.filter((h) => h.id !== habitId));
-    if (authUserId) {
-      syncDeleteDoc(authUserId, 'habits', habitId).then((lat) => setSyncLatencyMs(lat));
-    }
+    await supabase.from('habits').delete().eq('id', habitId);
   };
 
-  const handleToggleHabitCompletion = (habitId: string, date: string) => {
-    const existingIndex = habitCompletions.findIndex(
-      (c) => c.habitId === habitId && c.date === date
-    );
-
+  const handleToggleHabitCompletion = async (habitId: string, date: string) => {
+    const existingIndex = habitCompletions.findIndex((c) => c.habitId === habitId && c.date === date);
     let nextCompleted = true;
     let completionRecord: HabitCompletionRecord;
 
@@ -1091,174 +955,154 @@ export default function App() {
       setHabitCompletions((prev) => [...prev, completionRecord]);
     }
 
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'habitCompletions', completionRecord).then((lat) => setSyncLatencyMs(lat));
-    }
-
-    // Update habit streak count
-    let updatedHabit: Habit | null = null;
-    setHabits((prev) =>
-      prev.map((h) => {
-        if (h.id === habitId) {
-          const newCurrentStreak = nextCompleted
-            ? h.currentStreak + 1
-            : Math.max(0, h.currentStreak - 1);
-          const newBest = Math.max(h.bestStreak, newCurrentStreak);
-          const newTotal = nextCompleted ? h.totalCompletions + 1 : Math.max(0, h.totalCompletions - 1);
-
-          updatedHabit = {
-            ...h,
-            currentStreak: newCurrentStreak,
-            bestStreak: newBest,
-            totalCompletions: newTotal,
-          };
-          return updatedHabit;
-        }
-        return h;
-      })
-    );
-
-    if (updatedHabit && authUserId) {
-      syncSaveDoc(authUserId, 'habits', updatedHabit);
-    }
+    await supabase.from('habit_completions').upsert({
+      id: completionRecord.id,
+      habit_id: habitId,
+      user_id: authUserId,
+      date,
+      completed: nextCompleted,
+    });
   };
 
-  // Vacation & Planner Handlers
-  const handleSaveVacation = (vacation: VacationPlan) => {
+  const handleSaveVacation = async (vacation: VacationPlan) => {
     setVacations((prev) => {
       const exists = prev.some((v) => v.id === vacation.id);
-      if (exists) {
-        return prev.map((v) => (v.id === vacation.id ? vacation : v));
-      }
-      return [vacation, ...prev];
+      return exists ? prev.map((v) => (v.id === vacation.id ? vacation : v)) : [vacation, ...prev];
     });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'vacations', vacation).then((lat) => setSyncLatencyMs(lat));
-    }
+
+    await supabase.from('vacation_plans').upsert({
+      id: vacation.id,
+      user_id: authUserId,
+      title: vacation.title,
+      destination: vacation.destination,
+      country: vacation.country || 'India',
+      start_date: vacation.startDate,
+      end_date: vacation.endDate,
+      status: vacation.status,
+      estimated_budget: vacation.estimatedBudget || 0,
+      actual_spent: vacation.actualSpent || 0,
+      cover_gradient: vacation.coverGradient || null,
+      cover_emoji: vacation.coverEmoji || null,
+      travel_companions: vacation.travelCompanions || [],
+      itinerary: vacation.itinerary || [],
+      packing_list: vacation.packingList || [],
+      bookings: vacation.bookings || [],
+      notes: vacation.notes || null,
+    });
   };
 
-  const handleDeleteVacation = (vacationId: string) => {
+  const handleDeleteVacation = async (vacationId: string) => {
     setVacations((prev) => prev.filter((v) => v.id !== vacationId));
-    if (authUserId) {
-      syncDeleteDoc(authUserId, 'vacations', vacationId).then((lat) => setSyncLatencyMs(lat));
-    }
+    await supabase.from('vacation_plans').delete().eq('id', vacationId);
   };
 
   const handleTogglePackingItem = (vacationId: string, itemId: string) => {
-    let updatedVacation: VacationPlan | null = null;
     setVacations((prev) =>
       prev.map((v) => {
         if (v.id === vacationId) {
-          updatedVacation = {
+          const updated = {
             ...v,
-            packingList: v.packingList.map((item) =>
-              item.id === itemId ? { ...item, isPacked: !item.isPacked } : item
-            ),
+            packingList: v.packingList.map((item) => (item.id === itemId ? { ...item, isPacked: !item.isPacked } : item)),
           };
-          return updatedVacation;
+          handleSaveVacation(updated);
+          return updated;
         }
         return v;
       })
     );
-    if (updatedVacation && authUserId) {
-      syncSaveDoc(authUserId, 'vacations', updatedVacation);
-    }
   };
 
-  const handleSaveDateToRemember = (dateItem: DateToRemember) => {
+  const handleSaveDateToRemember = async (dateItem: DateToRemember) => {
     setDatesToRemember((prev) => {
       const exists = prev.some((d) => d.id === dateItem.id);
-      if (exists) {
-        return prev.map((d) => (d.id === dateItem.id ? dateItem : d));
-      }
-      return [...prev, dateItem].sort((a, b) => a.date.localeCompare(b.date));
+      return exists ? prev.map((d) => (d.id === dateItem.id ? dateItem : d)) : [...prev, dateItem].sort((a, b) => a.date.localeCompare(b.date));
     });
-    if (authUserId) {
-      syncSaveDoc(authUserId, 'datesToRemember', dateItem).then((lat) => setSyncLatencyMs(lat));
-    }
+
+    await supabase.from('dates_to_remember').upsert({
+      id: dateItem.id,
+      user_id: authUserId,
+      title: dateItem.title,
+      date: dateItem.date,
+      category: dateItem.category,
+      is_annual_recurring: dateItem.isAnnualRecurring ?? true,
+      reminder_days_before: dateItem.reminderDaysBefore || 1,
+      estimated_cost: dateItem.estimatedCost || 0,
+      icon: dateItem.icon || null,
+      color: dateItem.color || null,
+      person_name: dateItem.personName || null,
+      description: dateItem.description || null,
+      tags: dateItem.tags || [],
+      is_important: dateItem.isImportant ?? false,
+    });
   };
 
-  const handleDeleteDateToRemember = (id: string) => {
+  const handleDeleteDateToRemember = async (id: string) => {
     setDatesToRemember((prev) => prev.filter((d) => d.id !== id));
-    if (authUserId) {
-      syncDeleteDoc(authUserId, 'datesToRemember', id).then((lat) => setSyncLatencyMs(lat));
-    }
+    await supabase.from('dates_to_remember').delete().eq('id', id);
   };
 
-  const handleSaveUserProfile = (profile: UserProfile) => {
+  const handleSaveUserProfile = async (profile: UserProfile) => {
     setUserProfile(profile);
-    if (authUserId) {
-      syncSaveUserProfile(authUserId, profile).then((lat) => setSyncLatencyMs(lat));
-    }
-  };
-
-  // Export / Backup Handlers
-  const handleImportTransactions = (imported: Transaction[]) => {
-    setTransactions(imported);
-  };
-
-  const handleResetBudgetsToDefault = () => {
-    setCategories(DEFAULT_CATEGORIES);
-    setMonthlyBudgets(INITIAL_MONTHLY_BUDGETS);
-    saveCategories(DEFAULT_CATEGORIES);
-    saveMonthlyBudgets(INITIAL_MONTHLY_BUDGETS);
+    await supabase.from('user_profiles').upsert({
+      id: authUserId,
+      name: profile.name,
+      email: profile.email,
+      phone: profile.phone || null,
+      birthdate: profile.birthdate || null,
+      birthday_formatted: profile.birthdayFormatted || null,
+      bio: profile.bio || null,
+      avatar: profile.avatar || null,
+      city: profile.city || null,
+      country: profile.country || 'India',
+      occupation: profile.occupation || null,
+      blood_group: profile.bloodGroup || null,
+      emergency_contact_name: profile.emergencyContactName || null,
+      emergency_contact_phone: profile.emergencyContactPhone || null,
+      currency_symbol: profile.currencySymbol || '₹',
+      monthly_savings_target: profile.monthlySavingsTarget || 0,
+      emergency_fund_target: profile.emergencyFundTarget || 0,
+      target_weight_kg: profile.targetWeightKg || null,
+      daily_water_goal_ml: profile.dailyWaterGoalMl || 3000,
+      target_daily_sleep_hours: profile.targetDailySleepHours || 7.5,
+      favorite_festivals: profile.favoriteFestivals || [],
+      theme_preference: profile.themePreference || 'emerald',
+    });
   };
 
   const handleResetData = async () => {
-    if (authUserId) {
-      await wipeAndResetAllData(authUserId);
-    }
-    // Reset all financial records
+    await supabase.from('transactions').delete().eq('user_id', authUserId);
     setTransactions(INITIAL_SAMPLE_TRANSACTIONS);
     saveTransactions(INITIAL_SAMPLE_TRANSACTIONS);
-
     setAccounts(DEFAULT_ACCOUNTS);
     saveAccounts(DEFAULT_ACCOUNTS);
-
     setCreditCards(DEFAULT_CREDIT_CARDS);
     saveCreditCards(DEFAULT_CREDIT_CARDS);
-
     setLoans(DEFAULT_LOANS);
     saveLoans(DEFAULT_LOANS);
-
     setCategories(DEFAULT_CATEGORIES);
     saveCategories(DEFAULT_CATEGORIES);
-
     setMonthlyBudgets(INITIAL_MONTHLY_BUDGETS);
     saveMonthlyBudgets(INITIAL_MONTHLY_BUDGETS);
-
     setSavingsGoals(DEFAULT_SAVINGS_GOALS);
     saveSavingsGoals(DEFAULT_SAVINGS_GOALS);
-
     setGoalBadges(DEFAULT_GOAL_BADGES);
     saveGoalBadges(DEFAULT_GOAL_BADGES);
-
     setRecurringRules(DEFAULT_RECURRING_RULES);
     saveRecurringRules(DEFAULT_RECURRING_RULES);
-
     setWealthParams(DEFAULT_WEALTH_PARAMS);
     saveWealthParams(DEFAULT_WEALTH_PARAMS);
-
-    // Reset health & habits
     setVitalsLogs(DEFAULT_VITALS_LOGS);
     saveVitalsLogs(DEFAULT_VITALS_LOGS);
-
     setWorkouts(DEFAULT_WORKOUT_SESSIONS);
     saveWorkouts(DEFAULT_WORKOUT_SESSIONS);
-
     setHabits(DEFAULT_HABITS);
     saveHabits(DEFAULT_HABITS);
-
     setHabitBadges(DEFAULT_HABIT_BADGES);
     saveHabitBadges(DEFAULT_HABIT_BADGES);
-
-    // Reset Calendar & Planner
     setUserProfile(DEFAULT_USER_PROFILE);
     saveUserProfile(DEFAULT_USER_PROFILE);
-
     setVacations(DEFAULT_VACATIONS);
     saveVacations(DEFAULT_VACATIONS);
-
     setDatesToRemember(DEFAULT_DATES_TO_REMEMBER);
     saveDatesToRemember(DEFAULT_DATES_TO_REMEMBER);
   };
@@ -1300,7 +1144,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans flex flex-col antialiased selection:bg-indigo-600 selection:text-white">
-      {/* Top Navigation Bar with 3 Main Pillars & Finance 5 Sub-Modules */}
       <Navbar
         activePillar={activePillar}
         setActivePillar={setActivePillar}
@@ -1317,7 +1160,7 @@ export default function App() {
         onOpenGmailReminder={() => setIsGmailReminderModalOpen(true)}
         isSyncConnected={isSyncConnected}
         syncLatencyMs={syncLatencyMs}
-        currentUser={currentUser}
+        currentUser={null}
         userProfile={userProfile}
         totalTransactionsCount={transactions.length}
         activeGoalsCount={savingsGoals.length}
@@ -1325,7 +1168,6 @@ export default function App() {
         activeRecurringCount={recurringRules.filter((r) => r.status === 'active').length}
       />
 
-      {/* Main Workspace Body with Fluid Pillar Animations */}
       <main className="flex-1 pb-24 md:pb-12 overflow-hidden">
         <AnimatePresence mode="wait">
           <motion.div
@@ -1335,9 +1177,6 @@ export default function App() {
             exit={{ opacity: 0, y: -8, filter: 'blur(4px)' }}
             transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
           >
-            {/* ======================================================== */}
-            {/* PILLAR 1: INTERACTIVE UNIFIED LIFE DASHBOARD */}
-            {/* ======================================================== */}
             {activePillar === 'dashboard' && (
               <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 pt-6">
                 <UnifiedDashboardView
@@ -1374,12 +1213,8 @@ export default function App() {
               </div>
             )}
 
-            {/* ======================================================== */}
-            {/* PILLAR 2: FINANCE OS MODULES */}
-            {/* ======================================================== */}
             {activePillar === 'finance' && (
               <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 pt-6">
-                {/* 1. Daily Log & Khata */}
                 {financeSubTab === 'daily_log' && (
                   <div className="space-y-6">
                     <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 border-b border-slate-200 pb-5">
@@ -1402,7 +1237,7 @@ export default function App() {
                         <div className="hidden sm:block text-right border-r border-slate-200 pr-4">
                           <p className="text-xs font-semibold text-slate-700">{formattedToday}</p>
                           <p className="text-[10px] text-slate-400 uppercase tracking-wider font-medium">
-                            India • Live Local State
+                            India • Live Supabase State
                           </p>
                         </div>
 
@@ -1454,7 +1289,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* 2. Financial Engine: Accounts, Cards & Loans */}
                 {financeSubTab === 'financial_engine' && (
                   <FinancialEngineView
                     accounts={accounts}
@@ -1475,7 +1309,6 @@ export default function App() {
                   />
                 )}
 
-                {/* 3. Budget Rollover & Annual Matrix */}
                 {financeSubTab === 'budget_engine' && (
                   <BudgetEngineView
                     categories={categories}
@@ -1483,7 +1316,10 @@ export default function App() {
                     savedBudgets={monthlyBudgets}
                     onSaveMonthlyBudget={handleSaveMonthlyBudget}
                     onSaveBatchMonthlyBudgets={handleSaveBatchMonthlyBudgets}
-                    onResetBudgetsToDefault={handleResetBudgetsToDefault}
+                    onResetBudgetsToDefault={() => {
+                      setCategories(DEFAULT_CATEGORIES);
+                      setMonthlyBudgets(INITIAL_MONTHLY_BUDGETS);
+                    }}
                     onResetEntireApp={handleResetData}
                     onOpenLogTx={(type, cat, amt, desc) =>
                       handleOpenNewTransaction(type, undefined, undefined, undefined, cat, amt, desc)
@@ -1501,7 +1337,6 @@ export default function App() {
                   />
                 )}
 
-                {/* 4. Goal Savings Bucket Module */}
                 {financeSubTab === 'goal_savings' && (
                   <GoalSavingsBucketsView
                     goals={savingsGoals}
@@ -1513,7 +1348,6 @@ export default function App() {
                   />
                 )}
 
-                {/* 5. Wealth Forecasting Engine */}
                 {financeSubTab === 'wealth_forecasting' && (
                   <WealthForecastingView
                     initialParams={wealthParams}
@@ -1523,7 +1357,6 @@ export default function App() {
                   />
                 )}
 
-                {/* 6. Recurring Transactions & Standing Rules Engine */}
                 {financeSubTab === 'recurring' && (
                   <RecurringTransactionsView
                     rules={recurringRules}
@@ -1542,9 +1375,6 @@ export default function App() {
               </div>
             )}
 
-            {/* ======================================================== */}
-            {/* PILLAR 3: HEALTH & VITALITY MODULE */}
-            {/* ======================================================== */}
             {activePillar === 'health' && (
               <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 pt-6">
                 <HealthModuleView
@@ -1556,9 +1386,6 @@ export default function App() {
               </div>
             )}
 
-            {/* ======================================================== */}
-            {/* PILLAR 4: HABITS & STREAKS MODULE */}
-            {/* ======================================================== */}
             {activePillar === 'habits' && (
               <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 pt-6">
                 <HabitsModuleView
@@ -1572,9 +1399,6 @@ export default function App() {
               </div>
             )}
 
-            {/* ======================================================== */}
-            {/* PILLAR 5: CALENDAR 360° (LIFE LEDGER & FESTIVAL ART) */}
-            {/* ======================================================== */}
             {activePillar === 'calendar' && (
               <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 pt-6">
                 <CalendarView
@@ -1604,9 +1428,6 @@ export default function App() {
               </div>
             )}
 
-            {/* ======================================================== */}
-            {/* PILLAR 6: LIFE PLANNER (VACATIONS & DATES TO REMEMBER) */}
-            {/* ======================================================== */}
             {activePillar === 'planner' && (
               <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 pt-6">
                 <LifePlannerView
@@ -1641,86 +1462,6 @@ export default function App() {
         </AnimatePresence>
       </main>
 
-      {/* Footer Quick Module Switcher */}
-      <footer className="border-t border-slate-200 bg-white px-4 sm:px-8 py-3 flex flex-col sm:flex-row items-center justify-between text-xs gap-3">
-        <div className="flex gap-2 sm:gap-3 items-center flex-wrap">
-          <button
-            onClick={() => setActivePillar('dashboard')}
-            className={`text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition-all ${
-              activePillar === 'dashboard'
-                ? 'bg-slate-900 text-white shadow-2xs'
-                : 'text-slate-500 hover:text-slate-900'
-            }`}
-          >
-            1. Command Dashboard
-          </button>
-
-          <button
-            onClick={() => {
-              setActivePillar('finance');
-              setFinanceSubTab('daily_log');
-            }}
-            className={`text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition-all ${
-              activePillar === 'finance'
-                ? 'bg-indigo-600 text-white shadow-2xs'
-                : 'text-slate-500 hover:text-slate-900'
-            }`}
-          >
-            2. Finance OS (5 Tools)
-          </button>
-
-          <button
-            onClick={() => setActivePillar('health')}
-            className={`text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition-all ${
-              activePillar === 'health'
-                ? 'bg-rose-600 text-white shadow-2xs'
-                : 'text-slate-500 hover:text-slate-900'
-            }`}
-          >
-            3. Health & Vitality
-          </button>
-
-          <button
-            onClick={() => setActivePillar('habits')}
-            className={`text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition-all ${
-              activePillar === 'habits'
-                ? 'bg-purple-600 text-white shadow-2xs'
-                : 'text-slate-500 hover:text-slate-900'
-            }`}
-          >
-            4. Habits & Streaks
-          </button>
-
-          <button
-            onClick={() => setActivePillar('calendar')}
-            className={`text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition-all ${
-              activePillar === 'calendar'
-                ? 'bg-amber-600 text-white shadow-2xs'
-                : 'text-slate-500 hover:text-slate-900'
-            }`}
-          >
-            5. Calendar 360°
-          </button>
-
-          <button
-            onClick={() => setActivePillar('planner')}
-            className={`text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition-all ${
-              activePillar === 'planner'
-                ? 'bg-cyan-700 text-white shadow-2xs'
-                : 'text-slate-500 hover:text-slate-900'
-            }`}
-          >
-            6. Life Planner
-          </button>
-        </div>
-
-        <div className="text-[11px] text-slate-400 font-medium">
-          KAIONE OS • Executive Finance, Health, Habits & Life Synergy Engine
-        </div>
-      </footer>
-
-      {/* Global Modals */}
-      {/* 1. Transaction Form Modal */}
       <TransactionForm
         isOpen={isFormOpen}
         onClose={() => {
@@ -1749,7 +1490,6 @@ export default function App() {
         }}
       />
 
-      {/* 2. Person Ledger / Khata Modal */}
       <PersonLedgerModal
         isOpen={isLedgerModalOpen}
         onClose={() => setIsLedgerModalOpen(false)}
@@ -1758,7 +1498,6 @@ export default function App() {
         onUpdatePersonPhoneAndDueDate={handleUpdatePersonPhoneAndDueDate}
       />
 
-      {/* 3. Accounts Management Modal */}
       <AccountsModal
         isOpen={isAccountsModalOpen}
         onClose={() => setIsAccountsModalOpen(false)}
@@ -1768,7 +1507,6 @@ export default function App() {
         onDeleteAccount={handleDeleteAccount}
       />
 
-      {/* 4. Category Management Full Hub Modal */}
       <CategoryManagementModal
         isOpen={isCategoryManagerOpen}
         onClose={() => setIsCategoryManagerOpen(false)}
@@ -1784,7 +1522,6 @@ export default function App() {
         onDeleteCategory={handleDeleteCategory}
       />
 
-      {/* 5. Add / Edit Category Dialog Modal */}
       <AddEditCategoryModal
         isOpen={isAddCategoryOpen}
         onClose={() => {
@@ -1797,7 +1534,6 @@ export default function App() {
         existingCategories={categories}
       />
 
-      {/* 6. Quick Add / Edit Account / Bank Modal */}
       <AddEditAccountModal
         isOpen={isQuickAddAccountOpen}
         onClose={() => {
@@ -1810,31 +1546,27 @@ export default function App() {
         existingAccounts={accounts}
       />
 
-      {/* 7. Export / Import Backup Modal */}
       <ExportImportModal
         isOpen={isExportModalOpen}
         onClose={() => setIsExportModalOpen(false)}
         transactions={transactions}
         accounts={accounts}
-        onImportTransactions={handleImportTransactions}
+        onImportTransactions={(imported) => setTransactions(imported)}
         onResetData={handleResetData}
       />
 
-      {/* 8. Health Log Vitals Modal */}
       <LogVitalsModal
         isOpen={isVitalsModalOpen}
         onClose={() => setIsVitalsModalOpen(false)}
         onSaveVitals={handleSaveVitals}
       />
 
-      {/* 9. Health Log Workout Modal */}
       <LogWorkoutModal
         isOpen={isWorkoutModalOpen}
         onClose={() => setIsWorkoutModalOpen(false)}
         onSaveWorkout={handleSaveWorkout}
       />
 
-      {/* 10. Habits Add/Edit Modal */}
       <AddEditHabitModal
         isOpen={isHabitModalOpen}
         onClose={() => {
@@ -1845,7 +1577,6 @@ export default function App() {
         editingHabit={editingHabit}
       />
 
-      {/* 11. Personal Profile & VIP Milestones Modal */}
       <PersonalProfileModal
         isOpen={isProfileModalOpen}
         onClose={() => setIsProfileModalOpen(false)}
@@ -1853,7 +1584,6 @@ export default function App() {
         onSaveProfile={handleSaveUserProfile}
       />
 
-      {/* 12. Add/Edit Date to Remember Modal */}
       <AddEditDateModal
         isOpen={isAddDateModalOpen}
         onClose={() => {
@@ -1864,7 +1594,6 @@ export default function App() {
         editingDate={editingDate}
       />
 
-      {/* 13. Add/Edit Vacation Plan Modal */}
       <AddEditVacationModal
         isOpen={isAddVacationModalOpen}
         onClose={() => {
@@ -1875,7 +1604,6 @@ export default function App() {
         editingVacation={editingVacation}
       />
 
-      {/* 14. VitaFlow AI Advisor (Simple Words & 100% Satisfaction) */}
       <AIAdvisorModal
         isOpen={isAIAdvisorOpen}
         onClose={() => {
@@ -1895,20 +1623,18 @@ export default function App() {
         initialPrompt={aiAdvisorInitialPrompt}
       />
 
-      {/* Global Floating AI Advisor Pill */}
       <AIFloatingTrigger onOpen={() => handleOpenAIAdvisor()} />
 
-      {/* 15. Multi-Device Cloud Sync Modal */}
       <MultiDeviceSyncModal
         isOpen={isSyncModalOpen}
         onClose={() => setIsSyncModalOpen(false)}
         userId={authUserId}
-        currentUser={currentUser}
+        currentUser={null}
         latencyMs={syncLatencyMs}
         isConnected={isSyncConnected}
         onResetAllData={handleResetData}
-        onMigrateLocalToCloud={handleMigrateLocalToCloud}
-        onSwitchSyncWorkspace={handleSwitchSyncWorkspace}
+        onMigrateLocalToCloud={async () => {}}
+        onSwitchSyncWorkspace={(newId) => setAuthUserId(newId)}
         itemCounts={{
           transactions: transactions.length,
           accounts: accounts.length,
@@ -1919,7 +1645,6 @@ export default function App() {
         }}
       />
 
-      {/* 16. Gmail Daily 22:30 Automated Reminder Modal */}
       <GmailDailyReminderModal
         isOpen={isGmailReminderModalOpen}
         onClose={() => setIsGmailReminderModalOpen(false)}
@@ -1930,7 +1655,6 @@ export default function App() {
         vitalsLogs={vitalsLogs}
       />
 
-      {/* 17. Mobile Bottom Navigation Bar (Fixed for Mobile Viewports) */}
       <MobileBottomNav
         activePillar={activePillar}
         setActivePillar={(p) => setActivePillar(p)}
@@ -1940,7 +1664,6 @@ export default function App() {
         totalTransactionsCount={transactions.length}
       />
 
-      {/* 18. Mobile Quick Action & Hub Drawer */}
       <MobileQuickActionMenu
         isOpen={isMobileQuickMenuOpen}
         onClose={() => setIsMobileQuickMenuOpen(false)}
