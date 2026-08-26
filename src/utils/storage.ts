@@ -40,7 +40,6 @@ import {
   DEFAULT_VACATIONS,
   DEFAULT_DATES_TO_REMEMBER,
 } from './calendarAndPlannerData';
-import { ensureCleanFreshSlate } from './firebaseSync';
 
 // Ensure legacy sample keys are wiped clean on first launch
 
