@@ -43,7 +43,6 @@ import {
 import { ensureCleanFreshSlate } from './firebaseSync';
 
 // Ensure legacy sample keys are wiped clean on first launch
-ensureCleanFreshSlate();
 
 const STORAGE_KEYS = {
   TRANSACTIONS: 'pf_transactions_v1',
